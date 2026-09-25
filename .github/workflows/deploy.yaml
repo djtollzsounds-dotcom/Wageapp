@@ -1,0 +1,191 @@
+
+name: Deploy Reactive
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-west-2
+  AWS_ACCOUNT_ID: "507744946752"
+  ECR_REPOSITORY: reactive
+  CONTAINER_NAME: reactive
+  CONTAINER_PORT: 4173
+  HOST_PORT: 4173
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: self-hosted
+
+    permissions:
+      contents: read
+
+    steps:
+      # --------------------------------------------------
+      # 1. Checkout source code
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 2. Check environment
+      # --------------------------------------------------
+      - name: Check runner
+        run: |
+          echo "User:"
+          whoami
+
+          echo "Docker:"
+          docker --version
+
+          echo "AWS CLI:"
+          aws --version
+
+          echo "Docker permissions:"
+          docker ps
+
+      # --------------------------------------------------
+      # 3. Verify AWS identity
+      # --------------------------------------------------
+      - name: Check AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # --------------------------------------------------
+      # 4. Login to Amazon ECR
+      # --------------------------------------------------
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password \
+            --region "$AWS_REGION" \
+            | docker login \
+              --username AWS \
+              --password-stdin \
+              "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      # --------------------------------------------------
+      # 5. Check ECR repository
+      # --------------------------------------------------
+      - name: Check ECR repository
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION"
+
+      # --------------------------------------------------
+      # 6. Build Docker image
+      # --------------------------------------------------
+      - name: Build Docker image
+        run: |
+          docker build \
+            --pull \
+            -t "$ECR_REPOSITORY:${{ github.sha }}" \
+            -t "$ECR_REPOSITORY:latest" \
+            .
+
+      # --------------------------------------------------
+      # 7. Tag Docker image
+      # --------------------------------------------------
+      - name: Tag Docker image
+        run: |
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          docker tag \
+            "$ECR_REPOSITORY:${{ github.sha }}" \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+
+          docker tag \
+            "$ECR_REPOSITORY:latest" \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      # --------------------------------------------------
+      # 8. Push image to ECR
+      # --------------------------------------------------
+      - name: Push image to ECR
+        run: |
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          docker push \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+
+          docker push \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      # --------------------------------------------------
+      # 9. Stop existing container
+      # --------------------------------------------------
+      - name: Stop existing container
+        run: |
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
+
+      # --------------------------------------------------
+      # 10. Pull exact image from ECR
+      # --------------------------------------------------
+      - name: Pull new image
+        run: |
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          docker pull \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+
+      # --------------------------------------------------
+      # 11. Start new container
+      # --------------------------------------------------
+      - name: Start container
+        run: |
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p "$HOST_PORT:$CONTAINER_PORT" \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+
+      # --------------------------------------------------
+      # 12. Verify deployment
+      # --------------------------------------------------
+      - name: Verify container
+        run: |
+          echo "Waiting for container..."
+          sleep 5
+
+          echo "Container status:"
+          docker ps \
+            --filter "name=$CONTAINER_NAME"
+
+          RUNNING=$(docker inspect \
+            -f '{{.State.Running}}' \
+            "$CONTAINER_NAME" 2>/dev/null || echo "false")
+
+          if [ "$RUNNING" != "true" ]; then
+            echo "Container failed to start."
+            echo ""
+            echo "Container logs:"
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          fi
+
+          echo "Container is running successfully."
+
+      # --------------------------------------------------
+      # 13. Show deployment information
+      # --------------------------------------------------
+      - name: Deployment information
+        run: |
+          echo "======================================"
+          echo "Deployment successful"
+          echo "======================================"
+          echo "Commit:     ${{ github.sha }}"
+          echo "Repository: $ECR_REPOSITORY"
+          echo "Region:     $AWS_REGION"
+          echo "Container:  $CONTAINER_NAME"
+          echo "Port:       $HOST_PORT"
+          echo "======================================"
+
+          docker ps \
+            --filter "name=$CONTAINER_NAME"
